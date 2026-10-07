@@ -1,0 +1,394 @@
+import os
+import csv
+import cv2
+import numpy as np
+import torch
+import matplotlib
+import matplotlib.pyplot as plt
+import tkinter as tk
+from tkinter import filedialog
+from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+# =========================================================================
+# 1. LOAD PRETRAINED SEGFORMER-B1 (Pixel-Wise Classifier)
+# =========================================================================
+MODEL_NAME = "nvidia/segformer-b1-finetuned-cityscapes-1024-1024"
+
+TEST_DIR = "test_images"
+RESULTS_DIR = "results"
+LABELS_FILE = os.path.join(TEST_DIR, "labels.csv")  # format: filename,true_lanes
+SUPPORTED = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+MAX_WIDTH = 1024  # resize large photos so filter sizes stay consistent
+
+print("Loading SegFormer-B1 model...")
+feature_extractor = SegformerImageProcessor.from_pretrained(MODEL_NAME)
+model = SegformerForSemanticSegmentation.from_pretrained(MODEL_NAME)
+model.eval()
+print("Model ready.\n")
+
+
+# =========================================================================
+# 2. IMAGE LOADING / SELECTION
+# =========================================================================
+def load_image_rgb(path):
+    bgr = cv2.imread(path)
+    if bgr is None:
+        return None
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    if w > MAX_WIDTH:
+        scale = MAX_WIDTH / w
+        rgb = cv2.resize(rgb, (MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_AREA)
+    return rgb
+
+
+def list_test_images(directory=TEST_DIR):
+    os.makedirs(directory, exist_ok=True)
+    return sorted(f for f in os.listdir(directory) if f.lower().endswith(SUPPORTED))
+
+
+def select_single_image(directory=TEST_DIR):
+    files = list_test_images(directory)
+    print("=" * 55)
+    print(f"       SELECT AN IMAGE FROM '{directory}/'")
+    print("=" * 55)
+    for i, name in enumerate(files, 1):
+        print(f" {i}. {name}")
+    print(" 0. Browse any file from computer (Open File Dialog)")
+    print("=" * 55)
+
+    choice = input(f"Enter choice (0-{len(files)}): ").strip()
+    if choice == "0":
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        path = filedialog.askopenfilename(
+            title="Select Road Image",
+            filetypes=[("Image Files", "*.jpg;*.jpeg;*.png;*.bmp;*.webp"), ("All Files", "*.*")]
+        )
+        root.destroy()
+        return path
+    if choice.isdigit() and 1 <= int(choice) <= len(files):
+        return os.path.join(directory, files[int(choice) - 1])
+    if files:
+        return os.path.join(directory, files[0])
+    return None
+
+
+def load_ground_truth(labels_file=LABELS_FILE):
+    """Reads labels.csv (filename,true_lanes). Returns {filename: int}."""
+    truth = {}
+    if not os.path.exists(labels_file):
+        return truth
+    with open(labels_file, newline="") as f:
+        for row in csv.reader(f):
+            if len(row) < 2:
+                continue
+            name, value = row[0].strip(), row[1].strip()
+            if value.isdigit():
+                truth[name] = int(value)
+    return truth
+
+
+# =========================================================================
+# 3. TRADITIONAL CV PREPROCESSING + ML ROAD SEGMENTATION
+# =========================================================================
+def traditional_cv_preprocess(image_rgb):
+    """Enhance local contrast with CLAHE and smooth pavement noise."""
+    lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2RGB)
+    return cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+
+
+def ml_pixel_wise_classification(image_rgb):
+    """Pixel-wise drivable road surface mask from SegFormer (Cityscapes class 0 = road)."""
+    inputs = feature_extractor(images=image_rgb, return_tensors="pt")
+    with torch.no_grad():
+        logits = model(**inputs).logits
+
+    upsampled = torch.nn.functional.interpolate(
+        logits, size=image_rgb.shape[:2], mode="bilinear", align_corners=False
+    )
+    pred_seg = upsampled.argmax(dim=1)[0].cpu().numpy()
+    return (pred_seg == 0).astype(np.uint8) * 255
+
+
+# =========================================================================
+# 4. STRIPE EXTRACTION (GLARE-PROOF VIA TOP-HAT FILTERING)
+# =========================================================================
+def extract_slender_lane_stripes(image_rgb, road_mask):
+    """Thin bright stripes via horizontal top-hat + yellow paint, confined to the road mask."""
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+
+    kernel_tophat = cv2.getStructuringElement(cv2.MORPH_RECT, (28, 1))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_tophat)
+
+    hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+    yellow_mask = cv2.inRange(hsv, np.array([12, 60, 80]), np.array([38, 255, 255]))
+
+    _, tophat_thresh = cv2.threshold(tophat, 18, 255, cv2.THRESH_BINARY)
+    combined = cv2.bitwise_or(tophat_thresh, yellow_mask)
+    lane_pixels = cv2.bitwise_and(combined, road_mask)
+
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    return cv2.morphologyEx(lane_pixels, cv2.MORPH_OPEN, kernel_clean)
+
+
+# =========================================================================
+# 5. LINE TRACKING + LANE COUNTING
+# =========================================================================
+def fit_robust_lane_lines(image_rgb, clean_lanes, road_mask):
+    """
+    Detects line segments, clusters them into lane boundary lines, and counts lanes.
+    Returns (overlay_image, num_boundary_lines, num_lanes).
+    Lanes = boundary lines - 1 (lines are the edges, lanes are the gaps between them).
+    """
+    h, w = clean_lanes.shape
+
+    road_y_coords = np.nonzero(road_mask)[0]
+    y_horizon = int(np.percentile(road_y_coords, 2)) if len(road_y_coords) > 0 else int(h * 0.52)
+    y_horizon = max(int(h * 0.45), min(y_horizon, int(h * 0.65)))
+    y_bottom = h
+
+    lines = cv2.HoughLinesP(
+        clean_lanes, rho=1, theta=np.pi / 180, threshold=15,
+        minLineLength=18, maxLineGap=35
+    )
+
+    line_canvas = np.zeros_like(image_rgb)
+    overlay = image_rgb.copy()
+    overlay[road_mask > 0] = (overlay[road_mask > 0] * 0.78 +
+                              np.array([0, 180, 0], dtype=np.float32) * 0.22).astype(np.uint8)
+
+    if lines is None:
+        return overlay, 0, 0
+
+    valid_segments = []
+    for line in lines:
+        x1, y1, x2, y2 = line.reshape(-1)
+        if y1 == y2:
+            continue
+        if y1 < y2:  # make (x1, y1) the bottom point
+            x1, y1, x2, y2 = x2, y2, x1, y1
+
+        dx = x2 - x1
+        dy = y2 - y1
+        slope = dy / dx if dx != 0 else -999.0
+        if abs(slope) < 0.35:
+            continue
+
+        x_bottom = int(x1 + (y_bottom - y1) / slope)
+        if -w * 0.2 <= x_bottom <= w * 1.2:
+            valid_segments.append((x_bottom, x1, y1, x2, y2))
+
+    if not valid_segments:
+        return overlay, 0, 0
+
+    valid_segments.sort(key=lambda s: s[0])
+    clusters = []
+    current = [valid_segments[0]]
+    for seg in valid_segments[1:]:
+        if abs(seg[0] - current[-1][0]) < 65:
+            current.append(seg)
+        else:
+            clusters.append(current)
+            current = [seg]
+    clusters.append(current)
+
+    verified_lines = 0
+    for cluster in clusters:
+        total_len = sum(np.hypot(s[3] - s[1], s[4] - s[2]) for s in cluster)
+        # Only clusters with enough evidence count as a real lane boundary
+        if len(cluster) >= 2 or total_len > 40:
+            xs = [pt for s in cluster for pt in (s[1], s[3])]
+            ys = [pt for s in cluster for pt in (s[2], s[4])]
+            if len(set(ys)) < 2:
+                continue
+            fit = np.polyfit(ys, xs, 1)
+            x_bot = int(fit[0] * y_bottom + fit[1])
+            x_top = int(fit[0] * y_horizon + fit[1])
+            cv2.line(line_canvas, (x_bot, y_bottom), (x_top, y_horizon), (255, 0, 0), 5)
+            verified_lines += 1
+
+    overlay[line_canvas[:, :, 0] > 0] = [255, 0, 0]
+    num_lanes = max(verified_lines - 1, 0)
+    return overlay, verified_lines, num_lanes
+
+
+# =========================================================================
+# 6. FULL PIPELINE ON ONE IMAGE
+# =========================================================================
+def run_pipeline(image_rgb):
+    preprocessed = traditional_cv_preprocess(image_rgb)
+    road_mask = ml_pixel_wise_classification(preprocessed)
+    clean_lanes = extract_slender_lane_stripes(image_rgb, road_mask)
+    overlay, n_lines, n_lanes = fit_robust_lane_lines(image_rgb, clean_lanes, road_mask)
+    return {
+        "road_mask": road_mask,
+        "clean_lanes": clean_lanes,
+        "overlay": overlay,
+        "num_lines": n_lines,
+        "num_lanes": n_lanes,
+    }
+
+
+# =========================================================================
+# 7. RESULT FIGURES
+# =========================================================================
+def save_result_figure(image_rgb, result, name, true_lanes=None, out_dir=RESULTS_DIR, show=False):
+    os.makedirs(out_dir, exist_ok=True)
+    predicted = result["num_lanes"]
+
+    if true_lanes is None:
+        verdict, color = f"Predicted lanes: {predicted}", "black"
+    elif predicted == true_lanes:
+        verdict, color = f"Predicted: {predicted} | True: {true_lanes} | CORRECT", "green"
+    else:
+        verdict, color = f"Predicted: {predicted} | True: {true_lanes} | WRONG", "red"
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    axes[0, 0].imshow(image_rgb)
+    axes[0, 0].set_title(f"1. Input ({name})", fontweight="bold")
+    axes[0, 1].imshow(result["road_mask"], cmap="gray")
+    axes[0, 1].set_title("2. ML: Drivable Surface Mask (SegFormer-B1)", fontweight="bold")
+    axes[1, 0].imshow(result["clean_lanes"], cmap="gray")
+    axes[1, 0].set_title("3. Top-Hat Filter (Glare Eliminated)", fontweight="bold")
+    axes[1, 1].imshow(result["overlay"])
+    axes[1, 1].set_title("4. Lane Tracking Overlay", fontweight="bold")
+    for ax in axes.ravel():
+        ax.axis("off")
+
+    fig.suptitle(verdict, fontsize=16, fontweight="bold", color=color)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    out_path = os.path.join(out_dir, os.path.splitext(name)[0] + "_result.png")
+    fig.savefig(out_path, dpi=120)
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+# =========================================================================
+# 8. ACCURACY EVALUATION
+# =========================================================================
+def compute_accuracy(rows):
+    """rows: list of (name, predicted, true). Returns metrics dict for labeled rows."""
+    labeled = [(n, p, t) for n, p, t in rows if t is not None]
+    if not labeled:
+        return None
+    errors = [abs(p - t) for _, p, t in labeled]
+    n = len(labeled)
+    return {
+        "labeled_images": n,
+        "exact_accuracy": 100.0 * sum(e == 0 for e in errors) / n,
+        "within_one_accuracy": 100.0 * sum(e <= 1 for e in errors) / n,
+        "mean_abs_error": sum(errors) / n,
+    }
+
+
+def print_accuracy_report(rows):
+    print("\n" + "=" * 60)
+    print(f"{'Image':30s} {'Predicted':>10s} {'True':>6s} {'Result':>8s}")
+    print("-" * 60)
+    for name, pred, true in rows:
+        if true is None:
+            status, true_s = "n/a", "-"
+        else:
+            status, true_s = ("OK" if pred == true else "WRONG"), str(true)
+        print(f"{name[:30]:30s} {pred:>10d} {true_s:>6s} {status:>8s}")
+    print("=" * 60)
+
+    metrics = compute_accuracy(rows)
+    if metrics is None:
+        print("No ground-truth labels found, so accuracy cannot be computed.")
+        print(f"Add them to {LABELS_FILE} as 'filename,true_lanes' lines.")
+        return
+    print(f"Labeled images        : {metrics['labeled_images']}")
+    print(f"Exact-match accuracy  : {metrics['exact_accuracy']:.1f}%")
+    print(f"Within +/-1 lane      : {metrics['within_one_accuracy']:.1f}%")
+    print(f"Mean absolute error   : {metrics['mean_abs_error']:.2f} lanes")
+
+
+def save_summary_csv(rows, out_dir=RESULTS_DIR):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "summary.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "predicted_lanes", "true_lanes", "correct"])
+        for name, pred, true in rows:
+            correct = "" if true is None else int(pred == true)
+            writer.writerow([name, pred, "" if true is None else true, correct])
+    return path
+
+
+# =========================================================================
+# 9. RUN MODES
+# =========================================================================
+def run_single():
+    image_path = select_single_image(TEST_DIR)
+    if not image_path or not os.path.exists(image_path):
+        print("No image selected.")
+        return
+
+    name = os.path.basename(image_path)
+    image = load_image_rgb(image_path)
+    if image is None:
+        print("Could not read that image.")
+        return
+
+    truth = load_ground_truth().get(name)
+    if truth is None:
+        typed = input("True lane count for this image (press Enter to skip): ").strip()
+        truth = int(typed) if typed.isdigit() else None
+
+    print(f"\nProcessing: {image_path}")
+    result = run_pipeline(image)
+    print(f"Boundary lines found: {result['num_lines']}")
+    print(f"Estimated lane count: {result['num_lanes']}")
+    if truth is not None:
+        print(f"True lane count: {truth} -> {'CORRECT' if truth == result['num_lanes'] else 'WRONG'}")
+
+    out = save_result_figure(image, result, name, truth, show=True)
+    print(f"Figure saved to {out}")
+
+
+def run_batch():
+    files = list_test_images(TEST_DIR)
+    if not files:
+        print(f"No images found in '{TEST_DIR}/'.")
+        return
+
+    truth_map = load_ground_truth()
+    matplotlib.use("Agg")  # no pop-up windows in batch mode
+    rows = []
+    for i, name in enumerate(files, 1):
+        print(f"[{i}/{len(files)}] {name}")
+        image = load_image_rgb(os.path.join(TEST_DIR, name))
+        if image is None:
+            print("   could not read, skipped")
+            continue
+        result = run_pipeline(image)
+        true = truth_map.get(name)
+        save_result_figure(image, result, name, true)
+        rows.append((name, result["num_lanes"], true))
+
+    print_accuracy_report(rows)
+    print(f"\nFigures saved in '{RESULTS_DIR}/'")
+    print(f"Summary CSV: {save_summary_csv(rows)}")
+
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  1. Single image")
+    print("  2. Batch: run every image in test_images/ + accuracy")
+    print("=" * 55)
+    mode = input("Choose mode (1/2): ").strip()
+    if mode == "2":
+        run_batch()
+    else:
+        run_single()
+    print("Done!")
